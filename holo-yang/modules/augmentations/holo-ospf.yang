@@ -32,6 +32,10 @@ module holo-ospf {
       "RFC 9587 - YANG Data Model for OSPFv3 Extended LSAs";
   }
 
+  import holo-routing {
+    prefix hr;
+  }
+
   organization
     "Holo Routing Stack";
 
@@ -705,5 +709,75 @@ module holo-ospf {
          algorithms that have no corresponding YANG identity, such as
          Flexible Algorithms.";
     }
+  }
+
+  /*
+   * Groupings.
+   */
+  grouping redistribution {
+    description
+      "Route redistribution into AS-external LSAs.";
+    list redistribute {
+      key "type";
+      description
+        "Redistribute routes originated by the given protocol.";
+      leaf type {
+        type identityref {
+          base rt:control-plane-protocol;
+        }
+        must ". = 'ietf-routing:direct'"
+           + " or . = 'ietf-routing:static'"
+           + " or . = 'ietf-bgp:bgp'"
+           + " or . = 'ietf-isis:isis'"
+           + " or . = 'ietf-rip:ripv2'"
+           + " or . = 'ietf-rip:ripng'"
+           + " or . = 'holo-routing:kernel'" {
+          error-message
+            "Invalid protocol type.";
+        }
+        description
+          "Type of the control-plane protocol -- an identity
+           derived from the 'control-plane-protocol'
+           base identity.";
+      }
+      leaf metric {
+        type uint32 {
+          range "0..16777214";
+        }
+        default 0;
+        description
+          "The metric assigned to the redistributed routes. The
+           special value 16777215 (0xFFFFFF) cannot be used as it
+           means infinite metric in OSPF.";
+      }
+      leaf metric-type {
+        type enumeration {
+          enum "type-1" {
+            value 1;
+            description
+              "Type-1 external routes: the redistribution cost is
+               added to the path cost to the ASBR.";
+          }
+          enum "type-2" {
+            value 2;
+            description
+              "Type-2 external routes: the redistribution cost
+               dominates the path cost (default).";
+          }
+        }
+        default "type-2";
+        description
+          "The type of external metric assigned to the redistributed
+           routes.";
+      }
+    }
+  }
+
+  augment "/rt:routing/rt:control-plane-protocols/"
+        + "rt:control-plane-protocol/ospf:ospf" {
+    uses redistribution;
+    description
+      "Augments the OSPF instance (both OSPFv2 and OSPFv3) with
+       route redistribution.";
   }
 }

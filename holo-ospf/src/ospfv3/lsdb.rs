@@ -12,6 +12,7 @@ use holo_utils::bier::{
 };
 use holo_utils::ip::{AddressFamily, IpAddrKind, IpNetworkKind};
 use holo_utils::mpls::Label;
+use holo_utils::protocol::Protocol;
 use holo_utils::sr::{PrefixSidAlgo, Sid, SidLastHopBehavior, SrCfgEvent};
 use ipnetwork::IpNetwork;
 use itertools::Itertools;
@@ -28,18 +29,20 @@ use crate::instance::{InstanceArenas, InstanceUpView};
 use crate::interface::{Interface, InterfaceType, ism};
 use crate::lsdb::{self, LsaOriginateEvent, LsdbVersion, MAX_LINK_METRIC};
 use crate::neighbor::nsm;
+use crate::northbound::configuration::{ExternalMetricType, RedistributeCfg};
 use crate::ospfv3::packet::iana::{
     LsaFunctionCode, LsaRouterFlags, LsaRouterLinkType, Options, PrefixOptions,
 };
 use crate::ospfv3::packet::lsa::{
-    LsaBody, LsaHdr, LsaInterAreaPrefix, LsaInterAreaRouter,
-    LsaIntraAreaPrefix, LsaIntraAreaPrefixEntry, LsaLink, LsaLinkLocalAddr,
-    LsaLinkPrefix, LsaNetwork, LsaRouter, LsaRouterInfo, LsaRouterLink,
-    LsaScopeCode, LsaType, PrefixSid, kind,
+    LsaAsExternal, LsaAsExternalFlags, LsaBody, LsaHdr, LsaInterAreaPrefix,
+    LsaInterAreaRouter, LsaIntraAreaPrefix, LsaIntraAreaPrefixEntry, LsaLink,
+    LsaLinkLocalAddr, LsaLinkPrefix, LsaNetwork, LsaRouter, LsaRouterInfo,
+    LsaRouterLink, LsaScopeCode, LsaType, PrefixSid, kind,
 };
 use crate::packet::iana::RouterInfoCaps;
 use crate::packet::lsa::{
-    Lsa, LsaHdrVersion, LsaKey, LsaScope, LsaTypeVersion, PrefixSidVersion,
+    Lsa, LsaHdrVersion, LsaKey, LsaKind, LsaScope, LsaTypeVersion,
+    PrefixSidVersion,
 };
 use crate::packet::tlv::{
     BierEncapSubStlv, BierStlv, DynamicHostnameTlv, NodeAdminTagTlv,
@@ -51,7 +54,116 @@ use crate::version::Ospfv3;
 
 // ===== impl Ospfv3 =====
 
+// Allocates a Link State ID for a new AS-external LSA, skipping any ID
+// already claimed by a different prefix. The counter restarts with the
+// process, so after a restart a changed prefix set could otherwise hand
+// an in-use ID to a different prefix while old LSAs still linger in the
+// network. IDs may therefore change across process restarts (graceful
+// stops flush self-originated LSAs first, so no stale copies remain).
+fn next_external_lsa_id(
+    external_lsas: &BTreeMap<IpNetwork, (Protocol, Ipv4Addr)>,
+    next: &mut u32,
+) -> Ipv4Addr {
+    let taken: std::collections::BTreeSet<Ipv4Addr> =
+        external_lsas.values().map(|(_, id)| *id).collect();
+    loop {
+        let candidate = Ipv4Addr::from(*next);
+        *next = next.wrapping_add(1);
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+}
+
 impl LsdbVersion<Self> for Ospfv3 {
+    fn lsa_orig_external(
+        instance: &mut InstanceUpView<'_, Self>,
+        arenas: &InstanceArenas<Self>,
+        prefix: IpNetwork,
+        protocol: Protocol,
+        cfg: &RedistributeCfg,
+    ) {
+        // RFC 5340: an ASBR attached only to stub/NSSA areas must not
+        // originate AS-external LSAs.
+        if !arenas
+            .areas
+            .iter()
+            .any(|area| area.config.area_type == AreaType::Normal)
+        {
+            return;
+        }
+
+        // Reuse the LSA-ID already allocated for this prefix, if any,
+        // so that reorigination increments the sequence number of the
+        // existing LSA instead of creating a second one.
+        let lsa_id = match instance.state.external_lsas.get(&prefix) {
+            Some((_, lsa_id)) => *lsa_id,
+            None => next_external_lsa_id(
+                &instance.state.external_lsas,
+                &mut instance.state.external_lsa_id_next,
+            ),
+        };
+
+        let mut flags = LsaAsExternalFlags::empty();
+        match cfg.metric_type {
+            ExternalMetricType::Type1 => {}
+            ExternalMetricType::Type2 => flags |= LsaAsExternalFlags::E,
+        }
+
+        let lsa_body = LsaBody::AsExternal(LsaAsExternal {
+            extended: instance.config.extended_lsa,
+            flags,
+            metric: cfg.metric,
+            prefix_options: Default::default(),
+            prefix,
+            fwd_addr: None,
+            tag: None,
+            ref_lsa_type: None,
+            ref_lsa_id: None,
+            prefix_sids: Default::default(),
+            unknown_tlvs: Default::default(),
+            unknown_stlvs: Default::default(),
+        });
+
+        instance.tx.protocol_input.lsa_orig_check(
+            LsdbId::As,
+            None,
+            lsa_id,
+            lsa_body,
+        );
+        instance
+            .state
+            .external_lsas
+            .insert(prefix, (protocol, lsa_id));
+    }
+
+    fn lsa_flush_external(
+        instance: &mut InstanceUpView<'_, Self>,
+        arenas: &InstanceArenas<Self>,
+        prefix: IpNetwork,
+    ) {
+        let Some((_, lsa_id)) = instance.state.external_lsas.remove(&prefix)
+        else {
+            return;
+        };
+        let lsa_type =
+            kind::AsExternal(instance.config.extended_lsa).lsa_type();
+        let adv_rtr = instance.state.router_id;
+        let found = instance
+            .state
+            .lsdb
+            .iter_by_type_advrtr(&arenas.lsa_entries, lsa_type, adv_rtr)
+            .find(|(_, lse)| lse.data.hdr.lsa_id() == lsa_id)
+            .map(|(_, lse)| lse.id);
+        if let Some(lse_id) = found {
+            instance.tx.protocol_input.lsa_flush(
+                LsdbId::As,
+                lse_id,
+                LsaFlushReason::RedistributionRemoved,
+            );
+        }
+    }
+
     fn lsa_type_is_valid(
         area_type: Option<AreaType>,
         if_type: Option<InterfaceType>,
@@ -279,6 +391,13 @@ impl LsdbVersion<Self> for Ospfv3 {
                     lsa_orig_router(area, instance, arenas);
                 }
             }
+            LsaOriginateEvent::RedistributionChange => {
+                // (Re)originate Router-LSA(s) in all areas: the E
+                // (ASBR) bit depends on the redistribution config.
+                for area in arenas.areas.iter() {
+                    lsa_orig_router(area, instance, arenas);
+                }
+            }
             LsaOriginateEvent::GrHelperChange => {
                 // (Re)originate Router Information LSA(s) in all areas.
                 for area in arenas.areas.iter() {
@@ -500,6 +619,14 @@ fn lsa_orig_router(
 
     // Router-LSA's flags.
     let mut flags = LsaRouterFlags::empty();
+    if !instance.config.redistribution.is_empty()
+        && area.config.area_type == AreaType::Normal
+    {
+        // This router originates AS-external LSAs: advertise the E
+        // (ASBR) bit so that peers install the external routes. The
+        // E-bit is forbidden in Router-LSAs flooded into stub areas.
+        flags.insert(LsaRouterFlags::E);
+    }
     if arenas.areas.is_abr(&arenas.interfaces) {
         flags.insert(LsaRouterFlags::B);
     }
@@ -1303,4 +1430,27 @@ fn lsa_flush(
         lse_id,
         LsaFlushReason::PrematureAging,
     );
+}
+
+// ===== tests =====
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_lsa_id_allocation_skips_in_use_ids() {
+        let mut external: BTreeMap<IpNetwork, (Protocol, Ipv4Addr)> =
+            BTreeMap::new();
+        let mut next = 1u32;
+        let first = next_external_lsa_id(&external, &mut next);
+        assert_eq!(first, Ipv4Addr::new(0, 0, 0, 1));
+        external
+            .insert("fd00::/64".parse().unwrap(), (Protocol::KERNEL, first));
+        // A counter reset (process restart) must not hand an in-use
+        // ID to a different prefix.
+        let mut restarted = 1u32;
+        let second = next_external_lsa_id(&external, &mut restarted);
+        assert_eq!(second, Ipv4Addr::new(0, 0, 0, 2));
+    }
 }

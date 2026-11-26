@@ -1,0 +1,53 @@
+{
+  "ietf-interfaces:interfaces": {
+    "interface": [
+      {
+        "name": "veth-b",
+        "type": "iana-if-type:ethernetCsmacd",
+        "ietf-ip:ipv6": {}
+      }
+    ]
+  },
+  "ietf-routing:routing": {
+    "control-plane-protocols": {
+      "control-plane-protocol": [
+        {
+          "type": "ietf-ospf:ospfv3",
+          "name": "main",
+          "ietf-ospf:ospf": {
+            "explicit-router-id": "10.0.0.2",
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "veth-b",
+                        "interface-type": "point-to-point",
+                        "hello-interval": 1,
+                        "dead-interval": 4
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "holo-ospf:trace-options": {
+              "flag": [
+                {
+                  "name": "lsdb",
+                  "enabled": true
+                },
+                {
+                  "name": "flooding",
+                  "enabled": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

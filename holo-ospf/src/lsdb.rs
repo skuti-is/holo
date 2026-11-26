@@ -14,6 +14,9 @@ use bitflags::bitflags;
 use chrono::Utc;
 use derive_new::new;
 use holo_utils::bier::BierCfgEvent;
+use holo_utils::ip::IpNetworkKind;
+use holo_utils::protocol::Protocol;
+use holo_utils::southbound::{RouteKeyMsg, RouteMsg};
 use holo_utils::sr::SrCfgEvent;
 use holo_utils::task::TimeoutTask;
 use serde::{Deserialize, Serialize};
@@ -27,9 +30,10 @@ use crate::collections::{
 use crate::debug::{Debug, LsaFlushReason};
 use crate::error::Error;
 use crate::flood::flood;
-use crate::instance::{InstanceArenas, InstanceUpView};
+use crate::instance::{Instance, InstanceArenas, InstanceUpView};
 use crate::interface::{Interface, InterfaceType};
 use crate::neighbor::nsm;
+use crate::northbound::configuration::RedistributeCfg;
 use crate::packet::lsa::{
     Lsa, LsaBodyVersion, LsaHdrVersion, LsaKey, LsaTypeVersion,
 };
@@ -121,6 +125,7 @@ pub enum LsaOriginateEvent {
         lse_id: LsaEntryId,
     },
     StubRouterChange,
+    RedistributionChange,
     SrEnableChange,
     SrCfgChange {
         change: SrCfgEvent,
@@ -211,6 +216,23 @@ pub trait LsdbVersion<V: Version> {
         summary: &SummaryRtr<V>,
     ) -> u32;
 
+    // Originate a self-originated AS-external LSA for a redistributed
+    // route, allocating or reusing an LSA-ID for the prefix.
+    fn lsa_orig_external(
+        instance: &mut InstanceUpView<'_, V>,
+        arenas: &InstanceArenas<V>,
+        prefix: V::IpNetwork,
+        protocol: Protocol,
+        cfg: &RedistributeCfg,
+    );
+
+    // Flush the self-originated AS-external LSA for a prefix, if any.
+    fn lsa_flush_external(
+        instance: &mut InstanceUpView<'_, V>,
+        arenas: &InstanceArenas<V>,
+        prefix: V::IpNetwork,
+    );
+
     // Return the LSDB index corresponding to the provided LSA type.
     fn lsdb_get_by_lsa_type(
         iface_idx: InterfaceIndex,
@@ -226,6 +248,94 @@ pub trait LsdbVersion<V: Version> {
         lsdb_id: LsdbId,
         lsa: &Lsa<V>,
     );
+}
+
+// ===== route redistribution entry points =====
+
+// A redistributed route was added (or updated) in the default RIB:
+// originate (or reoriginate) the corresponding AS-external LSA.
+pub(crate) fn redistribute_add<V>(instance: &mut Instance<V>, msg: RouteMsg)
+where
+    V: Version,
+{
+    // Ignore prefixes that don't match the instance address-family.
+    let Some(prefix) = V::IpNetwork::get(msg.prefix) else {
+        return;
+    };
+    // Ignore routes whose source protocol is not being redistributed.
+    let Some(cfg) = instance.config.redistribution.get(&msg.protocol).cloned()
+    else {
+        return;
+    };
+    let Some((mut up_view, arenas)) = instance.as_up() else {
+        return;
+    };
+    V::lsa_orig_external(&mut up_view, arenas, prefix, msg.protocol, &cfg);
+}
+
+// A redistributed route was withdrawn from the default RIB: flush the
+// corresponding self-originated AS-external LSA, if any.
+pub(crate) fn redistribute_del<V>(instance: &mut Instance<V>, msg: RouteKeyMsg)
+where
+    V: Version,
+{
+    let Some(prefix) = V::IpNetwork::get(msg.prefix) else {
+        return;
+    };
+    let Some((mut up_view, arenas)) = instance.as_up() else {
+        return;
+    };
+    V::lsa_flush_external(&mut up_view, arenas, prefix);
+}
+
+// Redistribution for a protocol was removed: flush all external LSAs
+// originated from that protocol.
+pub(crate) fn redistribute_delete_protocol<V>(
+    instance: &mut Instance<V>,
+    protocol: Protocol,
+) where
+    V: Version,
+{
+    let Some((mut up_view, arenas)) = instance.as_up() else {
+        return;
+    };
+    let prefixes: Vec<V::IpNetwork> = up_view
+        .state
+        .external_lsas
+        .iter()
+        .filter(|(_, (source, _))| *source == protocol)
+        .map(|(prefix, _)| *prefix)
+        .collect();
+    for prefix in prefixes {
+        V::lsa_flush_external(&mut up_view, arenas, prefix);
+    }
+}
+
+// Redistribution parameters changed: reoriginate the external LSAs of
+// the affected protocol with the new metric / metric-type.
+pub(crate) fn redistribute_update_protocol<V>(
+    instance: &mut Instance<V>,
+    protocol: Protocol,
+) where
+    V: Version,
+{
+    let Some(cfg) = instance.config.redistribution.get(&protocol).cloned()
+    else {
+        return;
+    };
+    let Some((mut up_view, arenas)) = instance.as_up() else {
+        return;
+    };
+    let prefixes: Vec<V::IpNetwork> = up_view
+        .state
+        .external_lsas
+        .iter()
+        .filter(|(_, (source, _))| *source == protocol)
+        .map(|(prefix, _)| *prefix)
+        .collect();
+    for prefix in prefixes {
+        V::lsa_orig_external(&mut up_view, arenas, prefix, protocol, &cfg);
+    }
 }
 
 // ===== impl LsaEntry =====
