@@ -3062,3 +3062,47 @@ fn encode_prefix(prefix: &IpNetwork, buf: &mut BytesMut) {
     let plen_wire = prefix_wire_len(prefix.prefix());
     buf.put_slice(&prefix_bytes[0..plen_wire]);
 }
+
+// ===== tests =====
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::lsa::LsaKind;
+
+    #[test]
+    fn as_external_legacy_and_extended_encodings_roundtrip() {
+        let prefix: IpNetwork = "fd7a:115c:a1e0::53/128".parse().unwrap();
+        for extended in [false, true] {
+            let lsa = LsaBody::AsExternal(LsaAsExternal {
+                extended,
+                flags: LsaAsExternalFlags::E,
+                metric: 100,
+                prefix_options: Default::default(),
+                prefix,
+                fwd_addr: None,
+                tag: None,
+                ref_lsa_type: None,
+                ref_lsa_id: None,
+                prefix_sids: Default::default(),
+                unknown_tlvs: Default::default(),
+                unknown_stlvs: Default::default(),
+            });
+            let mut buf = BytesMut::new();
+            lsa.encode(&mut buf);
+            let lsa_type = kind::AsExternal(extended).lsa_type();
+            let mut bytes = buf.freeze();
+            let decoded = LsaBody::decode(
+                AddressFamily::Ipv6,
+                lsa_type,
+                Ipv4Addr::UNSPECIFIED,
+                &mut bytes,
+            )
+            .expect("decode as-external LSA");
+            let body = decoded.as_as_external().expect("as-external body");
+            assert_eq!(body.extended, extended);
+            assert_eq!(body.prefix, prefix);
+            assert_eq!(body.metric, 100);
+        }
+    }
+}

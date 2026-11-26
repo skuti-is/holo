@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 
 use holo_utils::ip::{AddressFamily, Ipv4NetworkExt};
 use holo_utils::mpls::Label;
+use holo_utils::protocol::Protocol;
 use holo_utils::sr::{PrefixSidAlgo, Sid, SidLastHopBehavior, SrCfgEvent};
 use ipnetwork::{IpNetwork, Ipv4Network};
 use itertools::Itertools;
@@ -27,12 +28,14 @@ use crate::lsdb::{
     self, LsaEntry, LsaOriginateEvent, LsdbVersion, MAX_LINK_METRIC,
 };
 use crate::neighbor::nsm;
+use crate::northbound::configuration::{ExternalMetricType, RedistributeCfg};
 use crate::ospfv2::packet::iana::{
     LsaExtPrefixFlags, LsaOpaqueType, LsaRouterFlags, LsaRouterLinkType,
     LsaTypeCode, Options,
 };
 use crate::ospfv2::packet::lsa::{
-    LsaBody, LsaHdr, LsaNetwork, LsaRouter, LsaRouterLink, LsaSummary, LsaType,
+    LsaAsExternal, LsaAsExternalFlags, LsaBody, LsaHdr, LsaNetwork, LsaRouter,
+    LsaRouterLink, LsaSummary, LsaType, kind,
 };
 use crate::ospfv2::packet::lsa_opaque::{
     ExtLinkTlv, ExtPrefixRouteType, ExtPrefixTlv, LsaExtLink, LsaExtPrefix,
@@ -40,7 +43,7 @@ use crate::ospfv2::packet::lsa_opaque::{
 };
 use crate::packet::iana::RouterInfoCaps;
 use crate::packet::lsa::{
-    Lsa, LsaHdrVersion, LsaKey, LsaScope, LsaTypeVersion,
+    Lsa, LsaHdrVersion, LsaKey, LsaKind, LsaScope, LsaTypeVersion,
 };
 use crate::packet::tlv::{
     DynamicHostnameTlv, NodeAdminTagTlv, PrefixSidFlags, RouterInfoCapsTlv,
@@ -51,7 +54,187 @@ use crate::version::Ospfv2;
 
 // ===== impl Ospfv2 =====
 
+// The network address with all host bits set (the broadcast address of
+// [net.ip(), net.mask()]).
+fn broadcast_addr(net: Ipv4Network) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(net.ip()) | !u32::from(net.mask()))
+}
+
+// RFC 2328 Appendix E Link State ID assignment for AS-external LSAs.
+// The network number is used whenever it is free; when two prefixes
+// share a network number (supernetting / subnet zero), the less
+// specific one keeps the network number and the more specific one uses
+// the network with all host bits set. Returns the Link State ID for
+// `prefix` plus any existing prefixes that must be re-keyed (each as
+// (prefix, new LS-ID)), or None when no collision-free assignment
+// exists — e.g. a broadcast-form ID already claimed by another prefix,
+// or a /32 that cannot move.
+fn ext_lsa_id_assignment(
+    existing: &BTreeMap<Ipv4Network, (Protocol, Ipv4Addr)>,
+    prefix: Ipv4Network,
+) -> Option<(Ipv4Addr, Vec<(Ipv4Network, Ipv4Addr)>)> {
+    // Reorigination of an already-known prefix keeps its assigned ID.
+    if let Some((_, id)) = existing.get(&prefix) {
+        return Some((*id, Vec::new()));
+    }
+    let na = prefix.ip();
+    let id_taken_by_other = |id: Ipv4Addr| {
+        existing
+            .iter()
+            .any(|(p, (_, used))| *used == id && *p != prefix)
+    };
+    let Some(older) = existing
+        .iter()
+        .find(|(p, (_, id))| *id == na && **p != prefix)
+        .map(|(p, _)| *p)
+    else {
+        return Some((na, Vec::new()));
+    };
+    if prefix.prefix() > older.prefix() {
+        // The new prefix is more specific: it takes the broadcast form
+        // of its own network.
+        let bcast = broadcast_addr(prefix);
+        if id_taken_by_other(bcast) {
+            return None;
+        }
+        Some((bcast, Vec::new()))
+    } else {
+        // The existing prefix is more specific: it moves to its
+        // broadcast form and the new, less specific prefix takes the
+        // network number.
+        let bcast = broadcast_addr(older);
+        if bcast == na || id_taken_by_other(bcast) {
+            return None;
+        }
+        Some((na, vec![(older, bcast)]))
+    }
+}
+
+// Originates (or reoriginates) one AS-external LSA under a chosen
+// Link State ID and records the prefix mapping.
+fn orig_external_with_id(
+    instance: &mut InstanceUpView<'_, Ospfv2>,
+    prefix: Ipv4Network,
+    protocol: Protocol,
+    cfg: &RedistributeCfg,
+    lsa_id: Ipv4Addr,
+) {
+    let mut flags = LsaAsExternalFlags::empty();
+    match cfg.metric_type {
+        ExternalMetricType::Type1 => {}
+        ExternalMetricType::Type2 => flags |= LsaAsExternalFlags::E,
+    }
+    let lsa_body = LsaBody::AsExternal(LsaAsExternal {
+        mask: prefix.mask(),
+        flags,
+        metric: cfg.metric,
+        fwd_addr: None,
+        tag: 0,
+    });
+    instance.tx.protocol_input.lsa_orig_check(
+        LsdbId::As,
+        None,
+        lsa_id,
+        lsa_body,
+    );
+    instance
+        .state
+        .external_lsas
+        .insert(prefix, (protocol, lsa_id));
+}
+
 impl LsdbVersion<Self> for Ospfv2 {
+    fn lsa_orig_external(
+        instance: &mut InstanceUpView<'_, Self>,
+        arenas: &InstanceArenas<Self>,
+        prefix: Ipv4Network,
+        protocol: Protocol,
+        cfg: &RedistributeCfg,
+    ) {
+        // RFC 2328: an ASBR attached only to stub/NSSA areas must not
+        // originate AS-external (Type-5) LSAs.
+        if !arenas
+            .areas
+            .iter()
+            .any(|area| area.config.area_type == AreaType::Normal)
+        {
+            return;
+        }
+
+        // RFC 2328 Appendix E: the Link State ID is the network number
+        // whenever free; prefixes sharing a network number are spread
+        // across the network-number / broadcast-form slots.
+        let (lsa_id, rekeys) = match ext_lsa_id_assignment(
+            &instance.state.external_lsas,
+            prefix,
+        ) {
+            Some(assignment) => assignment,
+            None => {
+                tracing::warn!(
+                    %prefix,
+                    "no collision-free Type-5 Link State ID (RFC 2328 Appendix E); skipping origination"
+                );
+                return;
+            }
+        };
+        for (older, new_id) in rekeys {
+            let Some((older_proto, _)) =
+                instance.state.external_lsas.get(&older).cloned()
+            else {
+                continue;
+            };
+            let Some(older_cfg) =
+                instance.config.redistribution.get(&older_proto)
+            else {
+                // Without the redistribution entry we cannot re-originate
+                // the displaced prefix; originating the new one would
+                // silently overwrite it. Bail out conservatively.
+                tracing::warn!(
+                    %older,
+                    "redistribution config missing during Link State ID re-key; skipping"
+                );
+                return;
+            };
+            orig_external_with_id(
+                instance,
+                older,
+                older_proto,
+                older_cfg,
+                new_id,
+            );
+        }
+        orig_external_with_id(instance, prefix, protocol, cfg, lsa_id);
+    }
+
+    fn lsa_flush_external(
+        instance: &mut InstanceUpView<'_, Self>,
+        arenas: &InstanceArenas<Self>,
+        prefix: Ipv4Network,
+    ) {
+        let Some((_, lsa_id)) = instance.state.external_lsas.remove(&prefix)
+        else {
+            return;
+        };
+        let adv_rtr = instance.state.router_id;
+        if let Some((_, lse)) = instance
+            .state
+            .lsdb
+            .iter_by_type_advrtr(
+                &arenas.lsa_entries,
+                kind::AsExternal.lsa_type(),
+                adv_rtr,
+            )
+            .find(|(_, lse)| lse.data.hdr.lsa_id() == lsa_id)
+        {
+            let lse_id = lse.id;
+            instance.tx.protocol_input.lsa_flush(
+                LsdbId::As,
+                lse_id,
+                LsaFlushReason::RedistributionRemoved,
+            );
+        }
+    }
+
     fn lsa_type_is_valid(
         area_type: Option<AreaType>,
         if_type: Option<InterfaceType>,
@@ -249,7 +432,14 @@ impl LsdbVersion<Self> for Ospfv2 {
                 process_self_originated_lsa(instance, arenas, lsdb_id, lse_id)?;
             }
             LsaOriginateEvent::StubRouterChange => {
-                // (Re)originate Router-LSA in all areas.
+                // (Re)originate Router-LSA(s) in all areas.
+                for area in arenas.areas.iter() {
+                    lsa_orig_router(area, instance, arenas);
+                }
+            }
+            LsaOriginateEvent::RedistributionChange => {
+                // (Re)originate Router-LSA(s) in all areas: the E
+                // (ASBR) bit depends on the redistribution config.
                 for area in arenas.areas.iter() {
                     lsa_orig_router(area, instance, arenas);
                 }
@@ -434,6 +624,14 @@ fn lsa_orig_router(
 
     // Router-LSA's flags.
     let mut flags = LsaRouterFlags::empty();
+    if !instance.config.redistribution.is_empty()
+        && area.config.area_type == AreaType::Normal
+    {
+        // This router originates AS-external LSAs: advertise the E
+        // (ASBR) bit so that peers install the external routes. The
+        // E-bit is forbidden in Router-LSAs flooded into stub areas.
+        flags.insert(LsaRouterFlags::E);
+    }
     if arenas.areas.is_abr(&arenas.interfaces) {
         flags.insert(LsaRouterFlags::B);
     }
@@ -1099,4 +1297,124 @@ fn lsa_flush(
         lse_id,
         LsaFlushReason::PrematureAging,
     );
+}
+
+// ===== tests =====
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn net(prefix: &str) -> Ipv4Network {
+        prefix.parse().unwrap()
+    }
+
+    fn addr(ip: &str) -> Ipv4Addr {
+        ip.parse().unwrap()
+    }
+
+    fn mapping(
+        entries: &[(&str, &str)],
+    ) -> BTreeMap<Ipv4Network, (Protocol, Ipv4Addr)> {
+        entries
+            .iter()
+            .map(|(p, id)| (net(p), (Protocol::KERNEL, addr(id))))
+            .collect()
+    }
+
+    #[test]
+    fn network_number_used_when_free() {
+        let e = mapping(&[]);
+        assert_eq!(
+            ext_lsa_id_assignment(&e, net("10.0.0.0/24")).unwrap().0,
+            addr("10.0.0.0")
+        );
+    }
+
+    #[test]
+    fn reorigination_keeps_assigned_id() {
+        let e = mapping(&[("10.0.0.0/24", "10.0.0.255")]);
+        assert_eq!(
+            ext_lsa_id_assignment(&e, net("10.0.0.0/24")).unwrap().0,
+            addr("10.0.0.255")
+        );
+    }
+
+    #[test]
+    fn more_specific_arriving_second_uses_broadcast_form() {
+        // /8 holds 10.0.0.0; the new /24 takes its broadcast form.
+        let e = mapping(&[("10.0.0.0/8", "10.0.0.0")]);
+        let (id, rekeys) =
+            ext_lsa_id_assignment(&e, net("10.0.0.0/24")).unwrap();
+        assert_eq!(id, addr("10.0.0.255"));
+        assert!(rekeys.is_empty());
+    }
+
+    #[test]
+    fn less_specific_arriving_second_rekeys_existing() {
+        // RFC 2328 Appendix E example steps (1)-(2): /24 holds
+        // 10.0.0.0; /16 arrives, takes 10.0.0.0, /24 moves to
+        // 10.0.0.255.
+        let e = mapping(&[("10.0.0.0/24", "10.0.0.0")]);
+        let (id, rekeys) =
+            ext_lsa_id_assignment(&e, net("10.0.0.0/16")).unwrap();
+        assert_eq!(id, addr("10.0.0.0"));
+        assert_eq!(rekeys, vec![(net("10.0.0.0/24"), addr("10.0.0.255"))]);
+    }
+
+    #[test]
+    fn three_way_rfc_example() {
+        // After steps (1)-(2) of the RFC example, /8 arrives: it takes
+        // 10.0.0.0 and the /16 moves to 10.0.255.255; the /24 keeps
+        // 10.0.0.255.
+        let e = mapping(&[
+            ("10.0.0.0/24", "10.0.0.255"),
+            ("10.0.0.0/16", "10.0.0.0"),
+        ]);
+        let (id, rekeys) =
+            ext_lsa_id_assignment(&e, net("10.0.0.0/8")).unwrap();
+        assert_eq!(id, addr("10.0.0.0"));
+        assert_eq!(rekeys, vec![(net("10.0.0.0/16"), addr("10.0.255.255"))]);
+    }
+
+    #[test]
+    fn broadcast_form_collision_is_unrepresentable() {
+        // The /24's broadcast form 10.0.0.255 is already claimed by a
+        // host route: no collision-free ID exists.
+        let e = mapping(&[
+            ("10.0.0.0/8", "10.0.0.0"),
+            ("10.0.0.255/32", "10.0.0.255"),
+        ]);
+        assert!(ext_lsa_id_assignment(&e, net("10.0.0.0/24")).is_none());
+    }
+
+    #[test]
+    fn independent_withdrawal_of_colliding_prefix() {
+        // /8 and /24 coexist per Appendix E: /8 holds 10.0.0.0, the
+        // /24 holds its broadcast form 10.0.0.255. Withdrawing the /8
+        // (lsa_flush_external removes exactly the prefix's mapping)
+        // must leave the /24 untouched, and the freed network number
+        // must be reusable without re-keying the survivor.
+        let mut e = mapping(&[
+            ("10.0.0.0/8", "10.0.0.0"),
+            ("10.0.0.0/24", "10.0.0.255"),
+        ]);
+        e.remove(&net("10.0.0.0/8"));
+        assert_eq!(
+            ext_lsa_id_assignment(&e, net("10.0.0.0/24")).unwrap().0,
+            addr("10.0.0.255")
+        );
+        let (id, rekeys) =
+            ext_lsa_id_assignment(&e, net("10.0.0.0/16")).unwrap();
+        assert_eq!(id, addr("10.0.0.0"));
+        assert!(rekeys.is_empty());
+    }
+
+    #[test]
+    fn host_route_cannot_be_displaced() {
+        // A /32 occupying the network number cannot move to a
+        // broadcast form (it is its own broadcast).
+        let e = mapping(&[("10.0.0.0/32", "10.0.0.0")]);
+        assert!(ext_lsa_id_assignment(&e, net("10.0.0.0/24")).is_none());
+    }
 }

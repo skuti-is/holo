@@ -29,13 +29,14 @@ use crate::lsdb::LsaOriginateEvent;
 use crate::neighbor::nsm;
 use crate::northbound::yang_gen::config::{
     self, AreaChange, AreaEntryChange, AreaInterfaceChange, AreaInterfaceEntryChange, AreaInterfaceStaticNeighborsNeighborChange, AreaInterfaceStaticNeighborsNeighborEntryChange, AreaInterfaceTraceOptionsFlagChange,
-    AreaInterfaceTraceOptionsFlagEntryChange, AreaRangeChange, AreaRangeEntryChange, AreaVirtualLinkChange, AreaVirtualLinkEntryChange, ConfigChange, TraceOptionsFlagChange, TraceOptionsFlagEntryChange,
+    AreaInterfaceTraceOptionsFlagEntryChange, AreaRangeChange, AreaRangeEntryChange, AreaVirtualLinkChange, AreaVirtualLinkEntryChange, ConfigChange, RedistributeChange, RedistributeEntryChange, TraceOptionsFlagChange,
+    TraceOptionsFlagEntryChange,
 };
 use crate::northbound::yang_gen::ospf;
 use crate::packet::iana::PacketType;
 use crate::route::RouteNetFlags;
 use crate::version::Version;
-use crate::{gr, ibus, spf, sr, tasks};
+use crate::{gr, ibus, lsdb, spf, sr, tasks};
 
 #[derive(Debug)]
 pub enum Resource {}
@@ -72,6 +73,9 @@ pub enum Event {
     BierEnableChange(bool),
     NodeTagsChange,
     UpdateTraceOptions,
+    RedistributeAdd(Protocol),
+    RedistributeDelete(Protocol),
+    RedistributeUpdate(Protocol),
 }
 
 // ===== configuration structs =====
@@ -96,6 +100,21 @@ pub struct InstanceCfg {
     pub instance_id: u8,
     pub bier: BierOspfCfg,
     pub trace_opts: InstanceTraceOptions,
+    pub redistribution: BTreeMap<Protocol, RedistributeCfg>,
+}
+
+// Parameters of a single route redistribution entry.
+#[derive(Clone, Debug, Default)]
+pub struct RedistributeCfg {
+    pub metric: u32,
+    pub metric_type: ExternalMetricType,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExternalMetricType {
+    Type1,
+    #[default]
+    Type2,
 }
 
 #[derive(Debug)]
@@ -292,6 +311,9 @@ where
         }
         ConfigChange::GracefulRestartHelperStrictLsaChecking(strict_lsa_checking) => {
             instance.config.gr.helper_strict_lsa_checking = strict_lsa_checking;
+        }
+        ConfigChange::Redistribute(keys, change) => {
+            apply_redistribute(instance, keys.r#type, change, event_queue)?;
         }
         ConfigChange::SpfControlPaths(max_paths) => {
             instance.config.max_paths = max_paths;
@@ -854,12 +876,63 @@ where
     Ok(())
 }
 
+fn apply_redistribute<V>(instance: &mut Instance<V>, protocol: Protocol, change: RedistributeChange, event_queue: &mut BTreeSet<Event>) -> Result<(), ApplyError>
+where
+    V: Version,
+{
+    match change {
+        RedistributeChange::Create => {
+            instance.config.redistribution.insert(protocol, RedistributeCfg::default());
+            event_queue.insert(Event::RedistributeAdd(protocol));
+        }
+        RedistributeChange::Delete => {
+            instance.config.redistribution.remove(&protocol);
+            event_queue.insert(Event::RedistributeDelete(protocol));
+        }
+        RedistributeChange::Entry(change) => {
+            let Some(cfg) = instance.config.redistribution.get_mut(&protocol) else {
+                return Err(ApplyError::EntryNotFound);
+            };
+            match change {
+                RedistributeEntryChange::Metric(metric) => {
+                    cfg.metric = metric;
+                }
+                RedistributeEntryChange::MetricType(metric_type) => {
+                    cfg.metric_type = match metric_type.as_str() {
+                        "type-1" => ExternalMetricType::Type1,
+                        _ => ExternalMetricType::Type2,
+                    };
+                }
+            }
+            event_queue.insert(Event::RedistributeUpdate(protocol));
+        }
+    }
+    Ok(())
+}
+
 fn process_event<V>(instance: &mut Instance<V>, event: Event)
 where
     V: Version,
 {
     match event {
         Event::InstanceReset => instance.reset(),
+        Event::RedistributeAdd(protocol) => {
+            instance.tx.ibus.route_redistribute_sub(protocol, instance.config.af);
+            // The E (ASBR) bit may have changed.
+            if let Some((up_view, _)) = instance.as_up() {
+                up_view.tx.protocol_input.lsa_orig_event(LsaOriginateEvent::RedistributionChange);
+            }
+        }
+        Event::RedistributeDelete(protocol) => {
+            instance.tx.ibus.route_redistribute_unsub(protocol, instance.config.af);
+            lsdb::redistribute_delete_protocol(instance, protocol);
+            if let Some((up_view, _)) = instance.as_up() {
+                up_view.tx.protocol_input.lsa_orig_event(LsaOriginateEvent::RedistributionChange);
+            }
+        }
+        Event::RedistributeUpdate(protocol) => {
+            lsdb::redistribute_update_protocol(instance, protocol);
+        }
         Event::InstanceUpdate => instance.update(),
         Event::InstanceIdUpdate => {
             for area_idx in instance.arenas.areas.indexes().collect::<Vec<_>>() {
@@ -1278,6 +1351,7 @@ impl Default for InstanceCfg {
             instance_id,
             bier: Default::default(),
             trace_opts: Default::default(),
+            redistribution: Default::default(),
         }
     }
 }

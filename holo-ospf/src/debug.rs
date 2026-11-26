@@ -136,6 +136,7 @@ pub enum SeqNoMismatchReason {
 pub enum LsaFlushReason {
     Expiry,
     PrematureAging,
+    RedistributionRemoved,
 }
 
 // Reason why the router failed to enter the helper mode.
@@ -611,6 +612,9 @@ impl std::fmt::Display for LsaFlushReason {
             }
             LsaFlushReason::PrematureAging => {
                 write!(f, "premature aging")
+            }
+            LsaFlushReason::RedistributionRemoved => {
+                write!(f, "redistribution removed")
             }
         }
     }

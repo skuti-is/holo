@@ -88,6 +88,11 @@ pub struct InstanceState<V: Version> {
     pub spf_schedule_time: Option<Instant>,
     // Routing table.
     pub rib: BTreeMap<V::IpNetwork, RouteNet<V>>,
+    // Self-originated AS-external LSAs: prefix -> (source protocol,
+    // LSA-ID), populated by route redistribution.
+    pub external_lsas: BTreeMap<V::IpNetwork, (Protocol, Ipv4Addr)>,
+    // Next LSA-ID to allocate for a self-originated AS-external LSA.
+    pub external_lsa_id_next: u32,
     // Statistics.
     pub orig_lsa_count: u32,
     pub rx_lsa_count: u32,
@@ -233,6 +238,17 @@ where
         // Store instance initial state.
         self.state = Some(state);
 
+        // Subscribe to the protocols being redistributed: the routing
+        // master replays the currently installed routes upon
+        // subscription, so subscribing here ensures no route is missed
+        // when the instance starts with routes already present in the
+        // default RIB.
+        let protocols: Vec<Protocol> =
+            self.config.redistribution.keys().copied().collect();
+        for protocol in protocols {
+            self.tx.ibus.route_redistribute_sub(protocol, Some(af));
+        }
+
         // Iterate over all configured areas.
         let (mut instance, arenas) = self.as_up().unwrap();
         for area in arenas.areas.iter() {
@@ -264,6 +280,16 @@ where
         }
 
         Debug::<V>::InstanceStop(reason).log();
+
+        // Drop redistribution subscriptions so holo-routing stops
+        // feeding a dead instance (mirrors the subscribe loop in
+        // start(); config deletion unsubscribes on its own).
+        let protocols: Vec<Protocol> =
+            self.config.redistribution.keys().copied().collect();
+        let af = self.state.as_ref().unwrap().af;
+        for protocol in protocols {
+            self.tx.ibus.route_redistribute_unsub(protocol, Some(af));
+        }
 
         // Flush all self-originated LSAs.
         let (mut instance, arenas) = self.as_up().unwrap();
@@ -552,6 +578,8 @@ where
         boot_count: u32,
     ) -> InstanceState<V> {
         InstanceState {
+            external_lsas: Default::default(),
+            external_lsa_id_next: 1,
             af,
             router_id,
             lsdb: Default::default(),
@@ -736,6 +764,14 @@ where
         // BFD peer state update event.
         IbusMsg::BfdStateUpd { sess_key, state } => {
             ibus::rx::process_bfd_state_update(instance, sess_key, state)?
+        }
+        // Route redistribute update notification.
+        IbusMsg::RouteRedistributeAdd(msg) => {
+            lsdb::redistribute_add(instance, msg);
+        }
+        // Route redistribute withdrawal notification.
+        IbusMsg::RouteRedistributeDel(msg) => {
+            lsdb::redistribute_del(instance, msg);
         }
         // Interface update notification.
         IbusMsg::InterfaceUpd(msg) => {
