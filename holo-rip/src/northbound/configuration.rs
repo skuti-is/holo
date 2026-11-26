@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use crate::debug::{Debug, InterfaceInactiveReason};
 use crate::ibus;
 use crate::instance::Instance;
 use crate::interface::{Interface, InterfaceIndex, SplitHorizon};
-use crate::northbound::yang_gen::config::{self, ConfigChange, InterfaceChange, InterfaceEntryChange, InterfaceNeighborChange, TraceOptionsFlagChange, TraceOptionsFlagEntryChange};
+use crate::northbound::yang_gen::config::{self, ConfigChange, InterfaceChange, InterfaceEntryChange, InterfaceNeighborChange, RedistributeChange, RedistributeEntryChange, TraceOptionsFlagChange, TraceOptionsFlagEntryChange};
 use crate::northbound::yang_gen::rip;
 use crate::northbound::yang_gen::routing::control_plane_protocols::control_plane_protocol;
 use crate::route::{Metric, RouteFlags};
@@ -41,6 +41,15 @@ pub enum Event {
     LeaveMulticast(InterfaceIndex),
     ReinstallRoutes,
     ResetUpdateInterval,
+    RedistributeAdd(Protocol),
+    RedistributeDelete(Protocol),
+    RedistributeUpdate(Protocol),
+}
+
+// Per-protocol redistribution settings.
+#[derive(Clone, Copy, Debug)]
+pub struct RedistributeCfg {
+    pub metric: u8,
 }
 
 // ===== configuration structs =====
@@ -53,6 +62,7 @@ pub struct InstanceCfg {
     pub update_interval: Duration,
     pub invalid_interval: Duration,
     pub flush_interval: Duration,
+    pub redistribution: BTreeMap<Protocol, RedistributeCfg>,
     pub trace_opts: TraceOptions,
 }
 
@@ -116,8 +126,43 @@ where
         ConfigChange::TraceOptionsFlag(keys, change) => {
             apply_trace_options(instance, keys.name, change)?;
         }
+        ConfigChange::Redistribute(keys, change) => {
+            apply_redistribute(instance, keys.r#type, change, event_queue)?;
+        }
         ConfigChange::Interface(keys, change) => {
             apply_interface(instance, keys.interface, change, event_queue)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_redistribute<V>(instance: &mut Instance<V>, protocol: Protocol, change: RedistributeChange, event_queue: &mut BTreeSet<Event>) -> Result<(), ApplyError>
+where
+    V: Version,
+{
+    match change {
+        RedistributeChange::Create => {
+            instance.config.redistribution.insert(
+                protocol,
+                RedistributeCfg {
+                    metric: 1,
+                },
+            );
+            event_queue.insert(Event::RedistributeAdd(protocol));
+        }
+        RedistributeChange::Delete => {
+            instance.config.redistribution.remove(&protocol);
+            event_queue.insert(Event::RedistributeDelete(protocol));
+        }
+        RedistributeChange::Entry(entry_change) => {
+            let cfg = instance.config.redistribution.get_mut(&protocol).ok_or(ApplyError::EntryNotFound)?;
+            match entry_change {
+                RedistributeEntryChange::Metric(metric) => {
+                    cfg.metric = metric;
+                    event_queue.insert(Event::RedistributeUpdate(protocol));
+                }
+            }
         }
     }
 
@@ -357,6 +402,16 @@ where
 
             instance.state.update_interval_task.reset(Some(instance.config.update_interval));
         }
+        Event::RedistributeAdd(protocol) => {
+            instance.tx.ibus.route_redistribute_sub(protocol, Some(V::ADDRESS_FAMILY));
+        }
+        Event::RedistributeDelete(protocol) => {
+            instance.tx.ibus.route_redistribute_unsub(protocol, Some(V::ADDRESS_FAMILY));
+            ibus::rx::redistribute_delete_protocol(instance, protocol);
+        }
+        Event::RedistributeUpdate(protocol) => {
+            ibus::rx::redistribute_update_protocol(instance, protocol);
+        }
     }
 }
 
@@ -399,6 +454,7 @@ impl Default for InstanceCfg {
             update_interval,
             invalid_interval,
             flush_interval,
+            redistribution: Default::default(),
             trace_opts: Default::default(),
         }
     }

@@ -15,12 +15,55 @@ module holo-rip {
     prefix rip;
   }
 
+  import holo-routing {
+    prefix hr;
+  }
+
   organization
     "Holo Routing Stack";
 
   description
     "This module defines augment statements for the ietf-rip
      module.";
+
+  grouping redistribution {
+    description
+      "Route redistribution into RIP.";
+    list redistribute {
+      key "type";
+      description
+        "Redistribute routes originated by the given protocol.";
+      leaf type {
+        type identityref {
+          base rt:control-plane-protocol;
+        }
+        must ". = 'ietf-routing:direct'"
+           + " or . = 'ietf-routing:static'"
+           + " or . = 'ietf-bgp:bgp'"
+           + " or . = 'ietf-isis:isis'"
+           + " or . = 'ietf-rip:ripv2'"
+           + " or . = 'ietf-rip:ripng'"
+           + " or . = 'holo-routing:kernel'" {
+          error-message
+            "Invalid protocol type.";
+        }
+        description
+          "Type of the control-plane protocol -- an identity
+           derived from the 'control-plane-protocol'
+           base identity.";
+      }
+      leaf metric {
+        type uint8 {
+          range "1..15";
+        }
+        default 1;
+        description
+          "The metric (hop count) assigned to the redistributed
+           routes. Values 0 and 16 are reserved (16 means
+           infinite distance in RIP).";
+      }
+    }
+  }
 
   /*
    * Augmentations.
@@ -59,5 +102,7 @@ module holo-rip {
         }
       }
     }
+
+    uses redistribution;
   }
 }

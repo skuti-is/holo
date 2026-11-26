@@ -42,6 +42,7 @@ pub struct Metric(u8);
 pub enum RouteType {
     Connected,
     Rip,
+    Redistributed,
 }
 
 bitflags! {

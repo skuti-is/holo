@@ -1,0 +1,33 @@
+{
+  "ietf-interfaces:interfaces": {
+    "interface": [
+      {
+        "name": "veth-b",
+        "type": "iana-if-type:ethernetCsmacd",
+        "ietf-ip:ipv6": {}
+      }
+    ]
+  },
+  "ietf-routing:routing": {
+    "control-plane-protocols": {
+      "control-plane-protocol": [
+        {
+          "type": "ietf-rip:ripng",
+          "name": "main",
+          "ietf-rip:rip": {
+            "timers": {
+              "update-interval": 1,
+              "invalid-interval": 3,
+              "flush-interval": 4
+            },
+            "interfaces": {
+              "interface": [
+                { "interface": "veth-b" }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
