@@ -9,13 +9,22 @@ use holo_northbound::yang_codegen::types::TypeSpec;
 use holo_yang as yang;
 
 // RIP-specific YANG identity types.
-static IDENTITY_TYPES: &[(&str, TypeSpec)] = &[(
-    "crypto-algorithm",
-    TypeSpec {
-        rust_type: "CryptoAlgo",
-        copy_semantics: true,
-    },
-)];
+static IDENTITY_TYPES: &[(&str, TypeSpec)] = &[
+    (
+        "crypto-algorithm",
+        TypeSpec {
+            rust_type: "CryptoAlgo",
+            copy_semantics: true,
+        },
+    ),
+    (
+        "control-plane-protocol",
+        TypeSpec {
+            rust_type: "Protocol",
+            copy_semantics: true,
+        },
+    ),
+];
 
 // RIP-specific YANG leaf types.
 static LEAF_TYPES: &[(&str, TypeSpec)] = &[

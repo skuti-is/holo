@@ -27,6 +27,7 @@ pub trait NorthboundVersion<V: Version> {
 #[allow(clippy::module_inception)]
 pub mod yang_gen {
     use holo_utils::crypto::CryptoAlgo;
+    use holo_utils::protocol::Protocol;
     pub use routing::control_plane_protocols::control_plane_protocol::rip;
 
     use crate::interface::SplitHorizon;

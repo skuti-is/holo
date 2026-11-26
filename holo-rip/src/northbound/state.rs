@@ -15,7 +15,7 @@ use crate::instance::Instance;
 use crate::interface::Interface;
 use crate::neighbor::Neighbor;
 use crate::northbound::yang_gen::rip;
-use crate::route::{Route, RouteFlags};
+use crate::route::{Route, RouteFlags, RouteType};
 use crate::version::{Ripng, Ripv2, Version};
 
 impl<V> Provider for Instance<V>
@@ -123,7 +123,7 @@ impl<'a> YangList<'a, Instance<Ripv2>> for rip::ipv4::routes::route::Route<'a> {
             ipv4_prefix: route.prefix,
             next_hop: route.nexthop,
             interface: instance.interfaces.get_by_ifindex(route.ifindex).map(|(_, iface)| Cow::Borrowed(iface.name.as_str())),
-            redistributed: Some(false),
+            redistributed: Some(route.route_type == RouteType::Redistributed),
             route_type: Some(route.route_type),
             metric: Some(route.metric.get()),
             expire_time: route.timeout_remaining().map(|d| d.as_secs().saturating_into()).ignore_in_testing(),
@@ -169,7 +169,7 @@ impl<'a> YangList<'a, Instance<Ripng>> for rip::ipv6::routes::route::Route<'a> {
             ipv6_prefix: route.prefix,
             next_hop: route.nexthop,
             interface: instance.interfaces.get_by_ifindex(route.ifindex).map(|(_, iface)| Cow::Borrowed(iface.name.as_str())),
-            redistributed: Some(false),
+            redistributed: Some(route.route_type == RouteType::Redistributed),
             route_type: Some(route.route_type),
             metric: Some(route.metric.get()),
             expire_time: route.timeout_remaining().map(|d| d.as_secs().saturating_into()).ignore_in_testing(),

@@ -1,0 +1,105 @@
+{
+  "ietf-interfaces:interfaces": {
+    "interface": [
+      {
+        "name": "veth-a",
+        "type": "iana-if-type:ethernetCsmacd",
+        "ietf-ip:ipv6": {}
+      }
+    ]
+  },
+  "ietf-routing-policy:routing-policy": {
+    "defined-sets": {
+      "prefix-sets": {
+        "prefix-set": [
+          {
+            "name": "TS-V6",
+            "mode": "ipv6",
+            "prefixes": {
+              "prefix-list": [
+                {
+                  "ip-prefix": "fd7a:115c:a1e0::/48",
+                  "mask-length-lower": 128,
+                  "mask-length-upper": 128
+                },
+                {
+                  "ip-prefix": "fd10:0:0:9::1/128",
+                  "mask-length-lower": 128,
+                  "mask-length-upper": 128
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "policy-definitions": {
+      "policy-definition": [
+        {
+          "name": "IMPORT-TAILSCALE",
+          "statements": {
+            "statement": [
+              {
+                "name": "10",
+                "conditions": {
+                  "match-prefix-set": { "prefix-set": "TS-V6" }
+                },
+                "actions": { "policy-result": "accept-route" }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "ietf-routing:routing": {
+    "ribs": {
+      "rib": [
+        {
+          "name": "tailscale-v6",
+          "address-family": "ietf-routing:ipv6",
+          "default-rib": false,
+          "holo-routing:kernel-table-id": 52
+        },
+        {
+          "name": "ipv6-unicast",
+          "address-family": "ietf-routing:ipv6",
+          "default-rib": true,
+          "holo-routing:import-rib": [
+            {
+              "source-rib": "tailscale-v6",
+              "import-policy": "IMPORT-TAILSCALE"
+            }
+          ]
+        }
+      ]
+    },
+    "control-plane-protocols": {
+      "control-plane-protocol": [
+        {
+          "type": "ietf-rip:ripng",
+          "name": "main",
+          "ietf-rip:rip": {
+            "timers": {
+              "update-interval": 1,
+              "invalid-interval": 3,
+              "flush-interval": 4
+            },
+            "interfaces": {
+              "interface": [
+                { "interface": "veth-a",
+                  "timers": { "update-interval": 1, "invalid-interval": 3, "flush-interval": 4 } }
+              ]
+            },
+            "trace-options": { "flag": [
+              { "name": "route", "send": true, "receive": true }
+            ] },
+          "holo-rip:redistribute": [
+              { "type": "holo-routing:kernel", "metric": 2 }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

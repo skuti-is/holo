@@ -226,6 +226,22 @@ fn process_pdu_response<V>(
         }
         let nexthop = Some(nexthop);
 
+        // A learned route always wins over a redistributed projection:
+        // drop the projected candidate so the fresh learned route takes
+        // its place below (the candidate stays in the store and will be
+        // re-promoted if this learned route later times out).
+        if !metric.is_infinite()
+            && instance
+                .state
+                .routes
+                .get(rte.prefix())
+                .is_some_and(|route| {
+                    route.route_type == RouteType::Redistributed
+                })
+        {
+            instance.state.routes.remove(rte.prefix());
+        }
+
         // Check if the route already exists in the routing table.
         match instance.state.routes.entry(*rte.prefix()) {
             btree_map::Entry::Occupied(mut o) => {
@@ -452,4 +468,23 @@ pub(crate) fn process_route_gc_timeout<V>(
         Debug::<V>::RouteGcTimeout(&prefix).log();
     }
     instance.state.routes.remove(&prefix);
+
+    // A redistributed candidate for this prefix becomes the active
+    // route again now that the learned route is gone; no neighbor
+    // resend is needed to restore it.
+    if let Some(protocol) = instance.state.redistributed.get(&prefix).copied()
+        && let Some(cfg) = instance.config.redistribution.get(&protocol)
+    {
+        let route = Route::new(
+            prefix,
+            0,
+            None,
+            Metric::from(cfg.metric),
+            0,
+            RouteType::Redistributed,
+            &instance.config.trace_opts,
+        );
+        instance.state.routes.insert(prefix, route);
+        instance.tx.protocol_input.trigger_update();
+    }
 }

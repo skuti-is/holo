@@ -19,6 +19,7 @@ impl ToYang for RouteType {
         match self {
             RouteType::Connected => "connected".into(),
             RouteType::Rip => "rip".into(),
+            RouteType::Redistributed => "external".into(),
         }
     }
 }

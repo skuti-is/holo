@@ -26,7 +26,7 @@ use crate::interface::Interfaces;
 use crate::neighbor::Neighbor;
 use crate::northbound::configuration::InstanceCfg;
 use crate::packet::Command;
-use crate::route::Route;
+use crate::route::{Route, RouteType};
 use crate::tasks::messages::input::{
     InitialUpdateMsg, NbrTimeoutMsg, RouteGcTimeoutMsg, RouteTimeoutMsg,
     TriggeredUpdMsg, TriggeredUpdTimeoutMsg, UdpRxPduMsg, UpdateIntervalMsg,
@@ -68,6 +68,8 @@ pub struct InstanceState<V: Version> {
     pub neighbors: BTreeMap<V::IpAddr, Neighbor<V>>,
     // RIP routing table.
     pub routes: BTreeMap<V::IpNetwork, Route<V>>,
+    // Redistributed routes: prefix -> source protocol.
+    pub redistributed: BTreeMap<V::IpNetwork, Protocol>,
     // Message statistics.
     pub statistics: MessageStatistics,
     // Authentication non-decreasing sequence number.
@@ -158,6 +160,20 @@ where
         let update_interval = self.config.update_interval;
         let state = InstanceState::new(update_interval, &self.tx);
         self.state = Some(state);
+
+        // Subscribe to the protocols being redistributed: the routing
+        // master replays the currently installed routes upon
+        // subscription, so subscribing here ensures no route is missed
+        // when the instance starts with routes already present in the
+        // default RIB.
+        let protocols: Vec<Protocol> =
+            self.config.redistribution.keys().copied().collect();
+        for protocol in protocols {
+            self.tx
+                .ibus
+                .route_redistribute_sub(protocol, Some(V::ADDRESS_FAMILY));
+        }
+
         let (mut instance, interfaces) = self.as_up().unwrap();
 
         // Try to start interfaces.
@@ -173,10 +189,38 @@ where
 
         Debug::<V>::InstanceStop(reason).log();
 
+        // Drop redistribution subscriptions so holo-routing stops
+        // feeding a dead instance (mirrors the subscribe loop in
+        // start(); config deletion unsubscribes on its own).
+        let protocols: Vec<Protocol> =
+            self.config.redistribution.keys().copied().collect();
+        for protocol in protocols {
+            self.tx
+                .ibus
+                .route_redistribute_unsub(protocol, Some(V::ADDRESS_FAMILY));
+        }
+
         // Stop interfaces.
         let (mut instance, interfaces) = self.as_up().unwrap();
         for iface in interfaces.iter_mut() {
             iface.stop(&mut instance, InterfaceInactiveReason::InstanceDown);
+        }
+
+        // Poison redistributed routes (they have no interface that
+        // could otherwise invalidate them).
+        let prefixes: Vec<V::IpNetwork> =
+            instance.state.redistributed.keys().copied().collect();
+        for prefix in prefixes {
+            instance.state.redistributed.remove(&prefix);
+            if let Some(route) = instance.state.routes.get_mut(&prefix)
+                && route.route_type == RouteType::Redistributed
+            {
+                route.invalidate(
+                    instance.config.flush_interval,
+                    instance.tx,
+                    &instance.config.trace_opts,
+                );
+            }
         }
     }
 
@@ -340,6 +384,7 @@ where
             pending_trigger_upd: false,
             neighbors: Default::default(),
             routes: Default::default(),
+            redistributed: Default::default(),
             statistics: Default::default(),
             // Initialize the authentication sequence number as the number of
             // seconds since the Unix epoch (1 January 1970).
@@ -452,6 +497,14 @@ where
         // Interface address delete notification.
         IbusMsg::InterfaceAddressDel(msg) => {
             ibus::rx::process_addr_del(instance, msg);
+        }
+        // Redistributed route addition notification.
+        IbusMsg::RouteRedistributeAdd(msg) => {
+            ibus::rx::process_redistribute_add(instance, msg);
+        }
+        // Redistributed route deletion notification.
+        IbusMsg::RouteRedistributeDel(msg) => {
+            ibus::rx::process_redistribute_del(instance, msg);
         }
         // Ignore other events.
         _ => {}
